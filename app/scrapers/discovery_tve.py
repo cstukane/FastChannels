@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import secrets
 import time
 import uuid
@@ -17,6 +18,8 @@ from ..gracenote_map import resolve_gracenote
 from ..models import TVEAccount
 from ..tve.adobe_pass import MvpdCooldownMixin, TVEAuthError, TVENotAuthorizedError, throttle_cox_login
 
+
+logger = logging.getLogger(__name__)
 
 SCHEME = 'discovery-tve://'
 API_BASE = 'https://us1-prod-direct.watch.hgtv.com'
@@ -343,7 +346,7 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
             # provider" for what was actually just a network hiccup
             # (confirmed live via a 2026-09 forum report for an MSO that
             # unambiguously IS a partner, per the exact-match check below).
-            raise TVEAuthError(f'Discovery TVE: partner list lookup failed: {exc}') from exc
+            raise TVEAuthError(f'Discovery TVE: partner list lookup failed ({type(exc).__name__}).') from exc
 
         # Each partner entry's own `flows[]` can carry an
         # `external_partner_id` that's literally the Adobe Pass mso_id —
@@ -360,6 +363,11 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
                 for flow in p.get('flows') or []:
                     if (flow.get('external_partner_id') or '') == mso_id:
                         return p.get('id')
+
+        # Optimum TV and legacy Optimum/Cablevision are different Adobe
+        # integrations. Never let the fuzzy name fallback select the latter.
+        if mso_id == 'AlticeOne':
+            raise TVEAuthError('Discovery partner list has no exact AlticeOne mapping; cannot select Optimum TV safely.')
 
         candidates = [c.strip().lower() for c in (mso_name, mso_id) if c]
         for candidate in candidates:
@@ -380,7 +388,8 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
 
     def _discovery_session_redirect(
         self, session: requests.Session, device_id: str, mso_id: str, mso_name: str,
-    ) -> tuple[str, requests.Response]:
+        *, browser_assisted: bool = False,
+    ) -> tuple[str, requests.Response | None]:
         """Registers a Discovery gauth session and returns (mso_login_url,
         page_response) without completing any login — this is the scripted
         part that's never blocked by an MSO's bot defense (confirmed live
@@ -398,6 +407,9 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
         mso_login_url/page_response instead of the whole method needing a
         synchronous, blocking login_to_mvpd() call it can't make for MSOs
         that require a human (YouTubeTV, Sling).
+
+        With browser_assisted=True, return the unfetched gauth target and
+        None instead; the browser must own the Adobe/SAML navigation.
         """
         # This anonymous token must be minted with x-device-info. Without it,
         # /login succeeds but the upgraded st later fails live playback with
@@ -439,6 +451,13 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
         if not target_url:
             raise TVEAuthError('Discovery gauth authorize did not return target_url.')
 
+        if browser_assisted:
+            # Like NBC, let the browser own the entire authenticate chain.
+            # AlticeOne returns a 200 SAML POST form, not a Location header.
+            # Pre-fetching it also puts Adobe cookies in the wrong cookie jar.
+            logger.info('[discovery-mvpd-login] stage=authenticate-ready mso_id=%s browser_handoff=true', mso_id)
+            return target_url, None
+
         r = session.get(target_url, headers={'User-Agent': UA, 'Accept': 'text/html,*/*'}, allow_redirects=False, timeout=30)
         if r.status_code in {301, 302, 303, 307, 308}:
             r = session.get(r.headers.get('location') or target_url, headers={'User-Agent': UA, 'Accept': 'text/html,*/*'}, allow_redirects=False, timeout=30)
@@ -479,7 +498,7 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
             timeout=30,
         )
         if r.status_code >= 400:
-            raise TVEAuthError(f'Discovery login returned HTTP {r.status_code}: {r.text[:300]}')
+            raise TVEAuthError(f'Discovery login returned HTTP {r.status_code}.')
         r.raise_for_status()
         login_token = (((r.json().get('data') or {}).get('attributes') or {}).get('token') or '').strip()
 
@@ -489,7 +508,7 @@ class DiscoveryTVEScraper(MvpdCooldownMixin, BaseScraper):
             timeout=20,
         )
         if r.status_code >= 400:
-            raise TVEAuthError(f'Discovery entitlement check returned HTTP {r.status_code}: {r.text[:300]}')
+            raise TVEAuthError(f'Discovery entitlement check returned HTTP {r.status_code}.')
         expires_at = _jwt_exp(login_token) or int(time.time()) + SESSION_TTL_SECONDS
         self._update_cache(SESSION_CACHE_KEY, {
             'cookies': _cookie_dict(session),

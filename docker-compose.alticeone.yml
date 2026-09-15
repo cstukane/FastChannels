@@ -1,0 +1,20 @@
+# Standalone test stack: do not combine with the production compose files.
+name: fastchannels-alticeone-test
+services:
+  fastchannels:
+    image: fastchannels:alticeone-v5.2.2-test
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:5524:5523"
+    environment:
+      VERSION_CHECK_ENABLED: "0"
+    volumes:
+      - test_data:/data
+      - test_adb_keys:/root/.android
+    restart: "no"
+
+volumes:
+  test_data:
+  test_adb_keys:

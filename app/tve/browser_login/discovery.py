@@ -83,7 +83,9 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
         scraper._update_config('device_id', device_id)
 
     try:
-        mso_login_url, page_response = scraper._discovery_session_redirect(session, device_id, mso_id, mso_name)
+        mso_login_url, _ = scraper._discovery_session_redirect(
+            session, device_id, mso_id, mso_name, browser_assisted=True,
+        )
     except TVENotAuthorizedError as exc:
         _record_tve_login_error('discovery', f'not entitled — {exc}')
         set_status('error', f'Discovery TVE: not entitled — {exc}')
@@ -93,12 +95,13 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
         set_status('error', f'Discovery TVE: {exc}')
         return
     except Exception as exc:  # noqa: BLE001
-        logger.exception('[discovery-mvpd-login] unexpected failure registering session')
-        _record_tve_login_error('discovery', str(exc))
-        set_status('error', f'Discovery TVE: {exc}')
+        message = f'Discovery session registration failed ({type(exc).__name__})'
+        logger.warning('[discovery-mvpd-login] stage=session-registration error=%s', type(exc).__name__)
+        _record_tve_login_error('discovery', message)
+        set_status('error', message)
         return
 
-    nav_url = mso_login_url or str(page_response.url)
+    nav_url = mso_login_url
 
     def _extract_code(url: str) -> str:
         if not (url.startswith(AUTH_HOST) or url.startswith(CALLBACK_BASE)):
@@ -137,9 +140,9 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
         with Camoufox(**camoufox_options) as context:
             page = context.pages[0] if context.pages else context.new_page()
             _prime_google_session(context, mso_id)
-            page.on('crash', lambda p: logger.warning('[discovery-mvpd-login] page CRASH event fired (url was %s)', _safe_page_url(p)))
+            page.on('crash', lambda p: logger.warning('[discovery-mvpd-login] page CRASH event fired'))
             page.on('close', lambda p: logger.warning('[discovery-mvpd-login] page CLOSE event fired'))
-            page.on('pageerror', lambda exc: logger.warning('[discovery-mvpd-login] page JS error: %s', str(exc)[:500]))
+            page.on('pageerror', lambda exc: logger.warning('[discovery-mvpd-login] page JS error (%s)', type(exc).__name__))
 
             youtube_gateway_responses = []
 
@@ -195,7 +198,7 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
             except Exception as exc:  # noqa: BLE001
                 if _is_browser_death(exc):
                     raise
-                set_status('error', f'Discovery TVE: failed to load sign-in page ({exc})')
+                set_status('error', f'Discovery TVE: failed to load sign-in page ({type(exc).__name__})')
                 return
             if mso_id == 'YouTubeTV':
                 try:
@@ -251,7 +254,7 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
                     page, account.username, account.password, r=r,
                     stop_key=MVPD_BROWSER_LOGIN_STOP_KEY, input_key=MVPD_BROWSER_LOGIN_INPUT_KEY,
                 )
-            set_status('running', 'Signing in to Discovery TVE…', landing_url)
+            set_status('running', 'Signing in to Discovery TVE…', _url_for_log(landing_url))
 
             # gauth-sync itself has a real client-side bug (confirmed live
             # 2026-08-28: a JS error — "can't access property 'type', o is
@@ -319,7 +322,7 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
                             except Exception as exc:  # noqa: BLE001
                                 if _is_browser_death(exc):
                                     raise
-                                logger.warning('[discovery-mvpd-login] gauth-sync reload failed: %s', exc)
+                                logger.warning('[discovery-mvpd-login] gauth-sync reload failed: %s', type(exc).__name__)
                             gauth_sync_stalled_since = None
                     else:
                         gauth_sync_stalled_since = None
@@ -346,8 +349,8 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
         if r.exists(MVPD_BROWSER_LOGIN_STOP_KEY):
             set_status('stopped', 'Cancelled')
             return
-        logger.exception('[discovery-mvpd-login] browser-assisted session failed')
-        set_status('error', f'Browser session failed: {exc}')
+        logger.warning('[discovery-mvpd-login] stage=browser-session error=%s', type(exc).__name__)
+        set_status('error', f'Browser session failed ({type(exc).__name__})')
         return
 
     try:
@@ -361,9 +364,10 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
         set_status('error', f'Discovery TVE: {exc}')
         return
     except Exception as exc:  # noqa: BLE001
-        logger.exception('[discovery-mvpd-login] unexpected failure finishing login')
-        _record_tve_login_error('discovery', str(exc))
-        set_status('error', f'Discovery TVE: {exc}')
+        message = f'Discovery token exchange or entitlement check failed ({type(exc).__name__})'
+        logger.warning('[discovery-mvpd-login] stage=login-completion error=%s', type(exc).__name__)
+        _record_tve_login_error('discovery', message)
+        set_status('error', message)
         return
 
     # Fresh, self-contained app_context — see _prime_google_session's

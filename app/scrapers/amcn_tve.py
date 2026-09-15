@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import logging
 import re
 import time
 import uuid
@@ -26,6 +27,8 @@ from ..tve.adobe_pass import (
     throttle_cox_login,
 )
 
+
+logger = logging.getLogger(__name__)
 
 # AMC Networks TVE scraper.
 #
@@ -612,7 +615,8 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
 
     def _adobe_session_redirect(
         self, channel: AMCNChannel, software_statement: str, device_id: str, mso_id: str,
-    ) -> tuple[AdobePassCoxClient, str, str, dict[str, str], requests.Response]:
+        *, browser_assisted: bool = False,
+    ) -> tuple[AdobePassCoxClient, str, str, dict[str, str], requests.Response | None]:
         """Registers an Adobe Pass v2 client and starts a session for `mso_id`.
 
         Returns (client, code, mso_login_url, auth_headers, page_response)
@@ -622,6 +626,9 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
         redirect it's just the raw 3xx response (unused), but DIRECTV's own
         backend needs its body directly since DIRECTV never redirects here
         at all (see app/tve/mvpd/directv.py's directv_login() docstring).
+
+        With browser_assisted=True, return the unfetched authenticate URL
+        and None for page_response; no prior MVPD cache is required.
         """
         client = AdobePassCoxClient(
             requestor_id=channel.requestor_id,
@@ -654,13 +661,23 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
             # possibly-temporary error. Any other session-request failure
             # (network blip, Adobe outage) stays generic/non-disabling.
             if 'does not exist or is disabled' in detail.lower():
-                raise TVENotAuthorizedError(f'{channel.name}: {mso_id} is not a participating provider for AMC Networks: {detail}')
-            raise TVEAuthError(f'{channel.name}: Adobe session request failed for MVPD {mso_id}: {detail}')
+                raise TVENotAuthorizedError(f'{channel.name}: {mso_id} is not a participating provider for AMC Networks.')
+            raise TVEAuthError(f'{channel.name}: Adobe session request failed for MVPD {mso_id} (HTTP {r.status_code}).')
         session_data = r.json()
         code = (session_data.get('code') or '').strip()
         auth_path = (session_data.get('url') or '').strip()
         if not code or not auth_path:
             raise TVEAuthError(f'{channel.name}: Adobe session did not return an auth code.')
+
+        if browser_assisted:
+            # Start a fresh requestor-specific session even with an empty cache.
+            # NBC uses the same handoff: the browser handles both 3xx redirects
+            # and 200 SAML POST forms and owns all Adobe/MVPD cookies.
+            logger.info(
+                '[amcn-mvpd-login] stage=authenticate-ready requestor_id=%s mso_id=%s browser_handoff=true',
+                channel.requestor_id, mso_id,
+            )
+            return client, code, urljoin(ADOBE_BASE, auth_path), auth_headers, None
 
         r = client.session.get(
             urljoin(ADOBE_BASE, auth_path),
@@ -695,7 +712,8 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
             headers={**auth_headers, 'Content-Type': 'application/json'},
             timeout=30,
         )
-        profile.raise_for_status()
+        if not profile.ok:
+            raise TVEAuthError(f'{channel.name}: Adobe profile lookup returned HTTP {profile.status_code}.')
         mso_profile = ((profile.json().get('profiles') or {}).get(mso_id) or {})
         attrs = mso_profile.get('attributes') or {}
         adobe_id = (((attrs.get('userID') or {}).get('value')) or '').strip()
@@ -708,13 +726,21 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
             headers={**auth_headers, 'Content-Type': 'application/json'},
             timeout=30,
         )
-        decision.raise_for_status()
+        if not decision.ok:
+            raise TVEAuthError(f'{channel.name}: Adobe authorization decision returned HTTP {decision.status_code}.')
         decisions = decision.json().get('decisions') or []
-        authorized = next((item for item in decisions if item.get('authorized') is True), None)
-        token_obj = (authorized or {}).get('token') or {}
+        result = next((item for item in decisions if item.get('resource') == channel.requestor_id), None)
+        if result is None:
+            raise TVEAuthError(f'{channel.name}: Adobe returned no decision for the requested resource.')
+        if result.get('authorized') is False:
+            logger.info('[amcn-mvpd-login] stage=authorize requestor_id=%s mso_id=%s result=denied', channel.requestor_id, mso_id)
+            raise TVENotAuthorizedError(f'{channel.name}: Adobe did not authorize {channel.requestor_id} for {mso_id}.')
+        if result.get('authorized') is not True:
+            raise TVEAuthError(f'{channel.name}: Adobe returned an invalid authorization decision.')
+        token_obj = result.get('token') or {}
         serialized = token_obj.get('serializedToken')
         if not serialized:
-            raise TVENotAuthorizedError(f'{channel.name}: Adobe did not authorize {channel.requestor_id} for {mso_id}.')
+            raise TVEAuthError(f'{channel.name}: Adobe allowed the resource but returned no media token.')
         return serialized, adobe_id, token_obj.get('notAfter')
 
     def _adobe_auth_cache_key(self, channel: AMCNChannel) -> str:
@@ -827,6 +853,8 @@ class AMCNetworksTVEScraper(MvpdCooldownMixin, BaseScraper):
                     )
                     self._save_adobe_auth_cache(channel, mso_id, adobe_token, adobe_id, notafter_ms)
                     return adobe_token, adobe_id
+                except TVENotAuthorizedError:
+                    raise
                 except Exception:
                     self._update_cache(self._adobe_session_cache_key(channel), {})
 

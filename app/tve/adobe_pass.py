@@ -13,6 +13,7 @@ from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -324,28 +325,51 @@ def _safe_url(value: str) -> str:
 
 def _script_urls(html_text: str, page_url: str) -> list[str]:
     urls: list[str] = []
-    for match in re.finditer(r'<script\b[^>]+src=["\']([^"\']+)["\']', html_text, flags=re.I):
-        src = match.group(1)
+    for script in BeautifulSoup(html_text, 'html.parser').find_all('script', src=True):
+        src = script['src']
         if '/build/desktop/' in src or '/_next/static/' in src:
-            urls.append(urljoin(page_url, src))
+            url = urljoin(page_url, src)
+            if url not in urls:
+                urls.append(url)
     return urls
 
 
 def _extract_adobe_statement(js_text: str, brand: str) -> Optional[str]:
-    brand = re.escape(brand)
-    patterns = [
-        rf'adobeSoftwareStatement=\{{.*?{brand}:"([^"]+)"',
-        rf'adobeSoftwareStatement:\{{.*?{brand}:"([^"]+)"',
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, js_text, flags=re.S)
-        if m and m.group(1).startswith('eyJ'):
-            return m.group(1)
+    # Bound the brand lookup to its statement map. The old .*? could cross
+    # the closing brace and accidentally select an unrelated brand value.
+    for match in re.finditer(r'''["']?adobeSoftwareStatement["']?\s*[:=]\s*\{([^{}]*)\}''', js_text):
+        value = re.search(
+            rf'''(?:^|,)\s*["']?{re.escape(brand)}["']?\s*:\s*["'](eyJ[^"']+)["']''',
+            match.group(1),
+        )
+        if value:
+            return value.group(1)
+    return None
+
+
+def _statement_from_config(data, brand: str) -> Optional[str]:
+    """Find only an explicitly brand-keyed statement in structured site data."""
+    if isinstance(data, dict):
+        statements = data.get('adobeSoftwareStatement')
+        statement = statements.get(brand) if isinstance(statements, dict) else None
+        if isinstance(statement, str) and statement.startswith('eyJ'):
+            return statement
+        children = data.values()
+    elif isinstance(data, list):
+        children = data
+    else:
+        return None
+    for child in children:
+        statement = _statement_from_config(child, brand)
+        if statement:
+            return statement
     return None
 
 
 def discover_aenetworks_software_statement(brand: str = 'history', session: Optional[requests.Session] = None) -> str:
     key = brand.lower()
+    if key not in AENETWORKS_LIVE_PAGES:
+        raise TVEAuthError('Unknown A+E brand for software statement discovery.')
     cached = _STATEMENT_CACHE.get(key)
     if cached and monotonic() - cached[0] < _STATEMENT_TTL_SECONDS:
         return cached[1]
@@ -362,38 +386,45 @@ def discover_aenetworks_software_statement(brand: str = 'history', session: Opti
     # brand's still-working page — tried here as a fallback after the
     # brand's own page, since the brand's own page is the more direct/
     # official source on the (likely common) case it still works.
-    primary_url = AENETWORKS_LIVE_PAGES.get(key, AENETWORKS_LIVE_PAGES['history'])
-    fallback_url = AENETWORKS_LIVE_PAGES['aetv']
-    urls_to_try = [primary_url] if primary_url == fallback_url else [primary_url, fallback_url]
+    primary_url = AENETWORKS_LIVE_PAGES[key]
+    urls_to_try = list(dict.fromkeys([primary_url, *AENETWORKS_LIVE_PAGES.values()]))
 
     for page_url in urls_to_try:
         try:
             r = sess.get(page_url, timeout=20)
             r.raise_for_status()
         except requests.RequestException:
+            logger.info('[aenetworks-tve] stage=statement-page brand=%s fetch_failed=true', key)
             continue
 
-        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text, flags=re.S)
-        if m:
+        soup = BeautifulSoup(r.text, 'html.parser')
+        # Attribute order, whitespace, nonce and quote style do not affect HTML.
+        # Config can move from props.config to props.pageProps.config.
+        for script in soup.find_all('script'):
+            script_text = script.string or ''
+            statement = None
             try:
-                data = json.loads(html.unescape(m.group(1)))
-                statement = (((data.get('props') or {}).get('config') or {}).get('adobeSoftwareStatement') or {}).get(key)
-                if statement and statement.startswith('eyJ'):
-                    _STATEMENT_CACHE[key] = (monotonic(), statement)
-                    return statement
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
-
-        for script_url in _script_urls(r.text, page_url):
-            try:
-                js = sess.get(script_url, timeout=20).text
-            except requests.RequestException:
-                continue
-            statement = _extract_adobe_statement(js, key)
+                statement = _statement_from_config(json.loads(script_text), key)
+            except (TypeError, ValueError):
+                statement = _extract_adobe_statement(script_text, key)
             if statement:
+                logger.info('[aenetworks-tve] stage=statement-discovered brand=%s source=inline', key)
                 _STATEMENT_CACHE[key] = (monotonic(), statement)
                 return statement
 
+        for script_url in _script_urls(r.text, r.url or page_url):
+            try:
+                bundle = sess.get(script_url, timeout=20)
+                bundle.raise_for_status()
+            except requests.RequestException:
+                continue
+            statement = _extract_adobe_statement(bundle.text, key)
+            if statement:
+                logger.info('[aenetworks-tve] stage=statement-discovered brand=%s source=bundle', key)
+                _STATEMENT_CACHE[key] = (monotonic(), statement)
+                return statement
+
+    logger.warning('[aenetworks-tve] stage=statement-discovery brand=%s exhausted_pages=%d', key, len(urls_to_try))
     raise TVEAuthError('Could not discover A+E Adobe software statement from the live site.')
 
 
@@ -688,6 +719,15 @@ class AdobePassCoxClient:
         session_guid = _text_between(self.ctx.authn_token, 'simpleTokenAuthenticationGuid')
         self.session.headers.update({'ap_19': guid, 'ap_23': session_index})
 
+        # Only known A+E identifiers, never the authn token or resource XML.
+        ae_requestor = self.requestor_id in {'HISTORY', 'AETV', 'LIFETIME', 'FYI'}
+        if ae_requestor:
+            resource_matches = f'<title>{self.requestor_id}</title>' in self.resource
+            logger.info(
+                '[aenetworks-tve] stage=authorize requestor_id=%s resource_title_matches=%s optimum_tv=%s',
+                self.requestor_id, resource_matches, mso == 'AlticeOne',
+            )
+
         r = self._post_lenient(
             f'{ADOBE_BASE}/adobe-services/authorize',
             data={
@@ -708,10 +748,17 @@ class AdobePassCoxClient:
         if '<error' in r.text:
             message = _adobe_error_message(r.text)
             if _adobe_error_code(r.text) == 'notAuthorized':
+                if ae_requestor:
+                    logger.info('[aenetworks-tve] stage=authorize requestor_id=%s result=notAuthorized HTTP=%d', self.requestor_id, r.status_code)
+                    # Do not reflect an arbitrary provider response body into
+                    # browser activity logs (it can contain credentials).
+                    raise TVENotAuthorizedError('The provider denied entitlement for this network.')
                 raise TVENotAuthorizedError(message)
+            if ae_requestor:
+                raise TVEAuthError(f'Adobe authorize returned an error for {self.requestor_id} (HTTP {r.status_code}).')
             raise TVEAuthError(message)
         if r.status_code >= 400:
-            raise TVEAuthError(f'Adobe authorize returned HTTP {r.status_code}: {r.text[:300]}')
+            raise TVEAuthError(f'Adobe authorize returned HTTP {r.status_code}.')
         self.ctx.authz_token = html.unescape(_text_between(r.text, 'authzToken'))
 
         return self._short_authorize(session_guid)

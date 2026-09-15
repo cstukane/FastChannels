@@ -100,9 +100,9 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
         with Camoufox(**camoufox_options) as context:
             page = context.pages[0] if context.pages else context.new_page()
             _prime_google_session(context, mso_id)
-            page.on('crash', lambda p: logger.warning('[amcn-mvpd-login] page CRASH event fired (url was %s)', _safe_page_url(p)))
+            page.on('crash', lambda p: logger.warning('[amcn-mvpd-login] page CRASH event fired'))
             page.on('close', lambda p: logger.warning('[amcn-mvpd-login] page CLOSE event fired'))
-            page.on('pageerror', lambda exc: logger.warning('[amcn-mvpd-login] page JS error: %s', str(exc)[:500]))
+            page.on('pageerror', lambda exc: logger.warning('[amcn-mvpd-login] page JS error (%s)', type(exc).__name__))
 
             # Single listener for the whole (multi-channel) browser session —
             # reset gateway_state['responses'] at the start of each channel's
@@ -141,7 +141,7 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                 try:
                     statement = scraper._amcn_software_statement(channel, account)
                     client, code, mso_login_url, auth_headers, _resp = scraper._adobe_session_redirect(
-                        channel, statement, device_id, mso_id,
+                        channel, statement, device_id, mso_id, browser_assisted=True,
                     )
                 except TVENotAuthorizedError:
                     failed.append(f'{channel.name}: not a participating provider')
@@ -150,8 +150,8 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                     failed.append(f'{channel.name}: {str(exc)[:120]}')
                     continue
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception('[amcn-mvpd-login] unexpected failure registering %s', channel.name)
-                    failed.append(f'{channel.name}: {str(exc)[:120]}')
+                    logger.warning('[amcn-mvpd-login] stage=session-registration requestor_id=%s error=%s', channel.requestor_id, type(exc).__name__)
+                    failed.append(f'{channel.name}: session registration failed ({type(exc).__name__})')
                     continue
 
                 gateway_state['responses'] = []
@@ -184,7 +184,7 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                 except Exception as exc:  # noqa: BLE001
                     if _is_browser_death(exc):
                         raise
-                    failed.append(f'{channel.name}: failed to load sign-in page ({exc})')
+                    failed.append(f'{channel.name}: failed to load sign-in page ({type(exc).__name__})')
                     continue
                 if mso_id == 'YouTubeTV':
                     try:
@@ -233,7 +233,7 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                         page, account.username, account.password, r=r,
                         stop_key=MVPD_BROWSER_LOGIN_STOP_KEY, input_key=MVPD_BROWSER_LOGIN_INPUT_KEY,
                     )
-                set_status('running', f'Signing in to {channel.name}…', landing_url)
+                set_status('running', f'Signing in to {channel.name}…', _url_for_log(landing_url))
 
                 wait_started = time.monotonic()
                 deadline = wait_started + _PER_CHANNEL_TIMEOUT_SECONDS
@@ -298,12 +298,16 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
                             if now - last_progress_log >= 60:
                                 logger.info(
                                     '[amcn-mvpd-login] %s poll not-yet/error: %s (next_poll=%.1fs)',
-                                    channel.name, exc, session_poll_interval,
+                                    channel.name, type(exc).__name__, session_poll_interval,
                                 )
                                 last_progress_log = now
                             continue
                         scraper._save_adobe_session_cache(channel, mso_id, code, client.ctx.access_token)
                         scraper._save_adobe_auth_cache(channel, mso_id, adobe_token, adobe_id, notafter_ms)
+                        logger.info(
+                            '[amcn-mvpd-login] stage=authorized requestor_id=%s mso_id=%s cache_queued=true',
+                            channel.requestor_id, mso_id,
+                        )
                         authorized.append(channel.name)
                         paired = True
                         break
@@ -342,8 +346,8 @@ def _run_amcn_browser_assisted_login(r, set_status, source, account, scraper, de
         if r.exists(MVPD_BROWSER_LOGIN_STOP_KEY):
             set_status('stopped', f'Cancelled — authorized: {", ".join(authorized)}.' if authorized else 'Cancelled.')
             return
-        logger.exception('[amcn-mvpd-login] browser-assisted session failed')
-        set_status('error', f'Browser session failed: {exc}')
+        logger.warning('[amcn-mvpd-login] stage=browser-session error=%s', type(exc).__name__)
+        set_status('error', f'Browser session failed ({type(exc).__name__})')
         return
 
     with flask_app.app_context():
