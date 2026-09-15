@@ -820,6 +820,17 @@ def run_stream_audit(source_name: str):
         # means users with neither bridge configured are unaffected.
         _bridge_capable = bool(getattr(scraper_cls, 'license_url', None))
         _drm_bridge_mode = _drm_bridge_mode_for(source_name)
+        # Sources that declare this are unconditionally DRM on every channel, by the
+        # scraper's own static knowledge — not something to re-derive from a live
+        # manifest fetch every audit cycle. A single fetch landing mid-ad-break (SSAI
+        # splices in genuinely clear ad segments on an otherwise-encrypted live
+        # channel — confirmed live 2026-09-12 on warner_tve: the play-time check found
+        # real Widevine DRM, the audit ~4 minutes later found none, same channel) would
+        # otherwise read as "clear," wrongly clearing requires_drm_bridge and exposing
+        # an undecryptable stream to normal clients. Below, this only widens the
+        # DRM-positive branch's trigger condition; the exact drm_type is still read
+        # from the manifest when present, and only defaults when the flag forced it.
+        _always_drm = getattr(scraper_cls, 'all_channels_require_drm_bridge', False)
         consecutive_errors = 0
         consecutive_skipped_403 = 0  # geo-block detector
         consecutive_transient_errors = 0  # resolve-timeout detector
@@ -1218,8 +1229,13 @@ def run_stream_audit(source_name: str):
                         ch.stream_info = _dash_info
                     _widevine  = WIDEVINE_UUID
                     _playready = PLAYREADY_UUID
-                    if _widevine in manifest_text.lower() or _playready in manifest_text.lower():
-                        _dash_drm_type = 'Widevine' if _widevine in manifest_text.lower() else 'PlayReady'
+                    _dash_has_widevine = _widevine in manifest_text.lower()
+                    _dash_has_drm_marker = _dash_has_widevine or _playready in manifest_text.lower()
+                    if _always_drm or _dash_has_drm_marker:
+                        # 'Widevine' is also the default when the flag forced this with no
+                        # marker in THIS particular fetch (e.g. an ad-break segment window)
+                        # — every current all_channels_require_drm_bridge source is Widevine.
+                        _dash_drm_type = 'PlayReady' if (_dash_has_drm_marker and not _dash_has_widevine) else 'Widevine'
                         if _bridge_capable and _drm_bridge_mode:
                             # DASH+Widevine (e.g. Amazon, Sling) plays via whichever bridge(s)
                             # are actually on for this source (PrismCast browser/EME and/or
@@ -1304,6 +1320,13 @@ def run_stream_audit(source_name: str):
                     continue
 
                 drm = inspect_hls_drm(manifest_text)
+                if not drm and _always_drm:
+                    # No marker in THIS particular fetch (e.g. an ad-break segment
+                    # window) — every current all_channels_require_drm_bridge source is
+                    # Widevine, so default to that rather than trusting a fetch that
+                    # landed on genuinely-clear ad content as proof the whole channel
+                    # is clear.
+                    drm = {'drm_type': 'Widevine'}
                 if drm:
                     _drm_type = drm.get('drm_type', 'DRM')
                     if _bridge_capable and _drm_bridge_mode:
@@ -3740,6 +3763,18 @@ if __name__ == '__main__':
                           id='fc_player_idle_watchdog', max_instances=1, coalesce=True,
                           misfire_grace_time=60)
 
+        def _scheduled_fc_player_playback_error_watchdog():
+            from app import fc_player_bridge
+            try:
+                with flask_app.app_context():
+                    fc_player_bridge.check_playback_errors()
+            except Exception as e:
+                logger.warning('[fc-player] playback-error watchdog check failed: %s', e)
+
+        scheduler.add_job(_scheduled_fc_player_playback_error_watchdog, 'interval', seconds=20,
+                          id='fc_player_playback_error_watchdog', max_instances=1, coalesce=True,
+                          misfire_grace_time=60)
+
         def _scheduled_remote_gracenote_refresh():
             from app.gracenote_map import fetch_remote_gracenote_map
             with flask_app.app_context():
@@ -3751,6 +3786,18 @@ if __name__ == '__main__':
 
         scheduler.add_job(_scheduled_remote_gracenote_refresh, 'interval', hours=24,
                           id='gracenote_remote_refresh', max_instances=1, coalesce=True)
+
+        def _scheduled_remote_gracenote_exclusions_refresh():
+            from app.gracenote_map import fetch_remote_gracenote_exclusions
+            with flask_app.app_context():
+                from app.models import AppSettings
+                url = AppSettings.get().effective_gracenote_exclusions_url()
+            ok, msg = fetch_remote_gracenote_exclusions(url)
+            if not ok:
+                logger.warning('[gracenote-exclusions] scheduled remote refresh failed: %s', msg)
+
+        scheduler.add_job(_scheduled_remote_gracenote_exclusions_refresh, 'interval', hours=24,
+                          id='gracenote_exclusions_remote_refresh', max_instances=1, coalesce=True)
 
         def _scheduled_tvtv_cache_refresh() -> str:
             try:
@@ -3975,6 +4022,17 @@ if __name__ == '__main__':
                     logger.warning('[gracenote-map] startup remote fetch failed: %s', msg)
             except Exception:
                 logger.exception('[gracenote-map] startup remote fetch error')
+
+            try:
+                from app.gracenote_map import fetch_remote_gracenote_exclusions
+                url = AppSettings.get().effective_gracenote_exclusions_url()
+                ok, msg = fetch_remote_gracenote_exclusions(url)
+                if ok:
+                    logger.info('[gracenote-exclusions] startup remote fetch: %s', msg)
+                else:
+                    logger.warning('[gracenote-exclusions] startup remote fetch failed: %s', msg)
+            except Exception:
+                logger.exception('[gracenote-exclusions] startup remote fetch error')
 
         while True:
             time.sleep(3600)

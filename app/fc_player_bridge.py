@@ -214,6 +214,30 @@ _IDLE_SINCE_KEY = 'fc:fc-player:idle-since'
 _WEB_HEARTBEAT_PREFIX = 'fc:fc-player:web-heartbeat:'
 _WEB_HEARTBEAT_TTL_S = 45
 
+# PlaybackActivity.onPlayerError logs at ERROR under this tag (see PlaybackActivity.java)
+# rather than reporting back over any network channel — there is none, everything here
+# is one-way adb. check_playback_errors() tails logcat for it instead so a failed tune
+# (DRM denial, entitlement rejection, decode error) shows up in FastChannels' own log
+# stream without pulling logcat off the device by hand.
+_PLAYBACK_ERROR_LOG_TAG = 'FCPlayer.Playback'
+# onPlayerError only ever fires for errors Media3's own internal playback thread catches
+# and wraps into a PlaybackException — a bug anywhere else in the app (onCreate, a
+# MediaSession callback, PlayerView's surface handling) runs outside that protection and
+# force-closes instead. PlaybackActivity's global UncaughtExceptionHandler (2026-09-14) logs
+# those under this SEPARATE tag before chaining to the platform's own crash handling —
+# separate from _PLAYBACK_ERROR_LOG_TAG deliberately: confirmed live that logging a real
+# forced crash (`adb shell am crash`) under the same tag as onPlayerError made it get
+# classified here as a mere "playback error" WARNING instead of an ERROR, since this
+# module only had the tag to go on. _ANDROIDRUNTIME_LOG_TAG is a second, independent
+# fallback — Android's own platform crash dump, which our handler chains into and which
+# would still fire even for a hypothetical crash before our handler gets installed — but
+# it's a shared system tag every crashing app on the device writes to, so entries under it
+# are filtered to ones naming our own package before being surfaced.
+_APP_CRASH_LOG_TAG = 'FCPlayer.Crash'
+_ANDROIDRUNTIME_LOG_TAG = 'AndroidRuntime'
+_PACKAGE_NAME = 'com.fastchannels.player'
+_LAST_ERROR_LOGCAT_LINE_KEY = 'fc:fc-player:last-error-logcat-line'
+
 
 def _redis():
     return redis.from_url(current_app.config['REDIS_URL'])
@@ -818,6 +842,48 @@ def _dvr_activity_channel_numbers(timeout: int = _DVR_POLL_TIMEOUT) -> set[str] 
     return numbers
 
 
+def _dvr_active_recording_channel_numbers(timeout: int = _DVR_POLL_TIMEOUT) -> set[str] | None:
+    """Guide numbers Channels DVR is actively recording right now, via its `/dvr/jobs`
+    endpoint (each job has `Time`, `Duration`, and a `Channels` guide-number list).
+
+    Added 2026-09-12 after a real community bug report: a scheduled recording gets
+    silently cut ~5 minutes in when idle-stop is enabled, because _dvr_activity_
+    channel_numbers()'s `/dvr` `activity` dict — scoped to live "Watching ch..."
+    client sessions — never gains an entry for an unattended scheduled recording (no
+    client tuned in, just the DVR's own recording engine pulling the stream).
+    Confirmed live against a real Channels DVR 2026-09-12: `/dvr/jobs` lists every
+    scheduled/in-progress job with absolute Time/Duration regardless of whether a
+    client is watching, so a job whose window contains "now" is treated as "in use"
+    here independent of the `/dvr` activity dict entirely.
+
+    Returns an empty set when DVR was reachable but nothing is recording right now.
+    Returns None only when DVR itself couldn't be reached — same "never treated as
+    idle" convention as _dvr_activity_channel_numbers().
+    """
+    dvr_url = (AppSettings.get().effective_channels_dvr_url() or '').strip().rstrip('/')
+    if not dvr_url:
+        return None
+    try:
+        resp = requests.get(f'{dvr_url}/dvr/jobs', timeout=timeout)
+        resp.raise_for_status()
+        jobs = resp.json() or []
+    except Exception as e:
+        logger.warning('[fc-player] DVR jobs check failed: %s', e)
+        return None
+    now = time.time()
+    numbers = set()
+    for job in jobs:
+        if job.get('Skipped') or job.get('Failed') or job.get('Dead'):
+            continue
+        start = job.get('Time')
+        duration = job.get('Duration')
+        if not isinstance(start, (int, float)) or not isinstance(duration, (int, float)):
+            continue
+        if start <= now <= start + duration:
+            numbers.update(str(n) for n in (job.get('Channels') or []))
+    return numbers
+
+
 def _dvr_guide_numbers_for_channel(channel_key: str, timeout: int = _DVR_POLL_TIMEOUT) -> set[str] | None:
     """Every DVR guide number, across all of Channels DVR's configured sources, whose
     channel `ID` matches this channel — found by scanning the `/devices` endpoint for
@@ -927,8 +993,10 @@ def _stop_playback() -> bool:
 def check_idle_and_stop() -> None:
     """Watchdog tick (app.worker's scheduled job). Resolves the triggered channel to
     its DVR guide number(s) via _dvr_guide_numbers_for_channel() (once, then cached),
-    and treats it as "in use" if either that guide number shows up in DVR's live
-    activity, or a recent /watch heartbeat exists for the same channel.
+    and treats it as "in use" if any of: that guide number shows up in DVR's live
+    "Watching" activity, DVR has an in-progress recording job for that guide number
+    (see _dvr_active_recording_channel_numbers()), or a recent /watch heartbeat
+    exists for the same channel.
     """
     if not idle_stop_enabled():
         return
@@ -967,6 +1035,10 @@ def check_idle_and_stop() -> None:
             now_numbers = _dvr_activity_channel_numbers()
             if now_numbers is not None and (tracked & now_numbers):
                 active = True
+            if not active:
+                recording_numbers = _dvr_active_recording_channel_numbers()
+                if recording_numbers is not None and (tracked & recording_numbers):
+                    active = True
         if not active and channel_key and _recent_web_heartbeat(channel_key):
             active = True
 
@@ -990,6 +1062,160 @@ def check_idle_and_stop() -> None:
             r.delete(_IDLE_SINCE_KEY)
     except Exception as e:
         logger.warning('[fc-player] idle-stop watchdog tick failed: %s', e)
+
+
+_LOGCAT_HEADER_RE = re.compile(r'^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \S+/\S+\(\s*\d+\):')
+
+
+def _group_logcat_entries(text: str) -> list[str]:
+    """Group `adb logcat -v time` output back into whole log entries.
+
+    Log.e(tag, msg, throwable) writes ONE entry whose message embeds the full stack
+    trace, but `-v time` repeats the IDENTICAL timestamp/tag/pid header on every
+    physical line of that trace when printing it — so a naive per-line split (or a
+    split on "line starts with a timestamp", since every line does) still shreds one
+    error into a dozen. Consecutive lines sharing the exact same header belong to the
+    same entry; a changed header (a different call, always at a different
+    millisecond in practice) starts a new one.
+    """
+    entries = []
+    current: list[str] = []
+    current_header = None
+    for line in text.splitlines():
+        # `-d` prints a bare "--------- beginning of <buffer>" marker for each ring
+        # buffer it dumps (main/system/crash/...) — not a real log line, and it
+        # carries no header to attach to whatever entry came before or after it, so
+        # drop it outright rather than let it become its own bogus "entry".
+        if not line.strip() or line.startswith('--------- beginning of'):
+            continue
+        m = _LOGCAT_HEADER_RE.match(line)
+        header = m.group(0) if m else current_header
+        if header != current_header and current:
+            entries.append('\n'.join(current))
+            current = []
+        current_header = header
+        current.append(line)
+    if current:
+        entries.append('\n'.join(current))
+    return entries
+
+
+def _is_relevant_entry(entry: str) -> bool:
+    """_ANDROIDRUNTIME_LOG_TAG is a shared system tag — every crashing app on the device
+    writes to it, not just ours — so an entry under it only counts if it actually names
+    our package (the standard "Process: <pkg>, PID: <pid>" line a FATAL EXCEPTION dump
+    always includes). Entries under our own two tags are never filtered here since those
+    are already exclusively ours."""
+    first_line = entry.splitlines()[0] if entry else ''
+    if _ANDROIDRUNTIME_LOG_TAG not in first_line:
+        return True
+    return _PACKAGE_NAME in entry
+
+
+def _entry_is_crash(entry: str) -> bool:
+    """True for a real crash (our own pre-crash tag, or the platform's own dump naming
+    our package — _is_relevant_entry already dropped ones that don't). False for a plain
+    _PLAYBACK_ERROR_LOG_TAG entry, which is a playback error Media3 already handled via
+    onPlayerError, not an uncaught exception."""
+    first_line = entry.splitlines()[0] if entry else ''
+    return _APP_CRASH_LOG_TAG in first_line or _ANDROIDRUNTIME_LOG_TAG in first_line
+
+
+def _entry_summary(entry: str) -> str:
+    """One-line summary for the log: for our own tags that's just the first physical
+    line, as before. For an AndroidRuntime dump specifically, the first line is only
+    ever "FATAL EXCEPTION: <thread>" — the actual exception type/message and the
+    process line follow a couple of lines later, so surface up to 3 header-stripped
+    lines instead of the uninformative first one alone."""
+    lines = entry.splitlines()
+    if not lines:
+        return entry.strip()
+    if _ANDROIDRUNTIME_LOG_TAG not in lines[0]:
+        return lines[0].strip()
+    content = [ln.split('): ', 1)[-1].strip() for ln in lines[:3]]
+    return ' | '.join(c for c in content if c)
+
+
+def check_playback_errors() -> None:
+    """Watchdog tick (app.worker's scheduled job): tail the device's logcat for a fresh
+    PlaybackActivity.onPlayerError entry OR an actual app crash (our own pre-crash tag,
+    or the platform's own AndroidRuntime dump scoped to our package — see
+    _is_relevant_entry/_entry_is_crash), and re-emit a summary line into FastChannels'
+    own log stream under this module's logger, so either one shows up in the admin log
+    viewer without anyone needing to physically pull logcat off the Fire TV/Android
+    device. The two are logged at different levels (error vs warning) so a real crash
+    — meaning something outside Media3's own internal error handling broke, see
+    PlaybackActivity's UncaughtExceptionHandler — reads as more severe than a playback
+    error the app already recovered from or cleanly exited on.
+
+    Each adb server (this container's included) needs its own `adb connect` before
+    `adb -s <address> shell ...` works — trigger_channel() already does this per call;
+    this watchdog runs independently of any trigger, so it has to do the same.
+
+    `adb logcat -d` dumps the whole (circular, bounded) buffer for the filtered tags
+    each time — cheap since our own two tags are only ever written on a real failure,
+    and AndroidRuntime entries not naming our package are dropped immediately. A
+    genuine post-onCreate crash produces both our own tag's entry AND an AndroidRuntime
+    entry for the same event (our UncaughtExceptionHandler logs, then chains to the
+    platform's own handler) — both get surfaced rather than deduplicated, since they
+    carry complementary detail (ours has the channel_key; AndroidRuntime's has
+    Android's canonical process/thread framing) and the redundancy only shows up on an
+    actual crash, which should be rare.
+
+    Log.e(tag, msg, throwable) writes ONE entry whose message embeds the full stack
+    trace, but `-v time` repeats the timestamp/tag/pid header on every line of that
+    trace when printing it — so this splits back into whole entries on that repeated
+    header (one onPlayerError call, or one crash dump, must become one emitted log
+    line, not a dozen) and tracks the last whole entry it already emitted in Redis,
+    logging only the newest lines of any new ones. If that entry has aged out of the
+    buffer (device rebooted, app reinstalled, first run ever) it deliberately only
+    surfaces the newest entry rather than replaying whatever backlog remains, the same
+    "don't replay a backlog" caution check_idle_and_stop() uses for its own DVR lookup
+    cache.
+    """
+    if not is_configured():
+        return
+    try:
+        address = _adb_address()
+    except FcPlayerNotConfigured:
+        return
+    try:
+        subprocess.run(['adb', 'connect', address], capture_output=True,
+                        timeout=_ADB_TIMEOUT, check=False)
+    except Exception as e:
+        logger.warning('[fc-player] playback-error watchdog adb connect failed: %s', e)
+        return
+    ok, text = _adb_shell(address, 'logcat', '-d', '-v', 'time',
+                           '-s', f'{_PLAYBACK_ERROR_LOG_TAG}:E', f'{_APP_CRASH_LOG_TAG}:E',
+                           f'{_ANDROIDRUNTIME_LOG_TAG}:E', '*:S')
+    if not ok or not text.strip():
+        return
+    entries = [e for e in _group_logcat_entries(text) if _is_relevant_entry(e)]
+    if not entries:
+        return
+
+    try:
+        r = _redis()
+        last_seen = (r.get(_LAST_ERROR_LOGCAT_LINE_KEY) or b'').decode() or None
+    except Exception as e:
+        logger.warning('[fc-player] playback-error watchdog redis read failed: %s', e)
+        return
+
+    if last_seen and last_seen in entries:
+        new_entries = entries[entries.index(last_seen) + 1:]
+    else:
+        new_entries = entries[-1:]
+    for entry in new_entries:
+        if _entry_is_crash(entry):
+            logger.error('[fc-player] device app CRASHED (uncaught exception, not just a '
+                         'playback error): %s', _entry_summary(entry))
+        else:
+            logger.warning('[fc-player] device playback error: %s', _entry_summary(entry))
+
+    try:
+        r.set(_LAST_ERROR_LOGCAT_LINE_KEY, entries[-1])
+    except Exception as e:
+        logger.warning('[fc-player] playback-error watchdog redis write failed: %s', e)
 
 
 def trigger_channel(manifest_url: str, license_url: str | None = None, *, name: str = 'FastChannels',
