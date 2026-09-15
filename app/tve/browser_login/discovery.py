@@ -19,6 +19,7 @@ from app.tve.browser_login.common import (
     _maybe_capture_google_master_token,
     _relay_input_and_screenshot,
     _autofill_xfinity_credentials,
+    _try_autofill_credentials,
     _harvest_and_save_xfinity_cookies,
     _is_browser_death,
     _url_for_log,
@@ -253,6 +254,14 @@ def _run_discovery_browser_assisted_login(r, set_status, source, account, scrape
                 _autofill_xfinity_credentials(
                     page, account.username, account.password, r=r,
                     stop_key=MVPD_BROWSER_LOGIN_STOP_KEY, input_key=MVPD_BROWSER_LOGIN_INPUT_KEY,
+                )
+            elif account.username and account.password:
+                # Match the generic MVPD flow: best effort on a visible login
+                # form; account pickers/captcha/SSO continue to normal polling.
+                _try_autofill_credentials(
+                    page, account.username, account.password, r=r,
+                    stop_key=MVPD_BROWSER_LOGIN_STOP_KEY, input_key=MVPD_BROWSER_LOGIN_INPUT_KEY,
+                    navigation_already_settled=True,
                 )
             set_status('running', 'Signing in to Discovery TVE…', _url_for_log(landing_url))
 

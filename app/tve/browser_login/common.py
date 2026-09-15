@@ -601,7 +601,7 @@ def _try_autofill_credentials(
             if page.locator('input[type="password"]:visible').count() > 0:
                 break
         except Exception as exc:  # noqa: BLE001
-            logger.info('[mvpd-login] autofill: locator query failed: %s', exc)
+            logger.info('[mvpd-login] autofill: locator query failed (%s)', type(exc).__name__)
             return False
         if r is not None:
             now = time.monotonic()
@@ -615,7 +615,7 @@ def _try_autofill_credentials(
                     return False
         page.wait_for_timeout(300)
     else:
-        logger.info('[mvpd-login] autofill: no visible password field after %.1fs (SSO already past login, a captcha-first page, or an unrecognized form) url=%s', wait_seconds, _safe_page_url(page))
+        logger.info('[mvpd-login] autofill: no visible password field after %.1fs (SSO already past login, a captcha-first page, or an unrecognized form)', wait_seconds)
         return False
 
     page.wait_for_timeout(1200)  # the form animates in — let it become clickable/stable
@@ -644,7 +644,7 @@ def _try_autofill_credentials(
         for fill_attempt in (1, 2):
             pw_loc = page.locator('input[type="password"]:visible')
             if pw_loc.count() == 0:
-                logger.info('[mvpd-login] autofill: password field disappeared before fill (page likely mid-redirect) url=%s', _safe_page_url(page))
+                logger.info('[mvpd-login] autofill: password field disappeared before fill (page likely mid-redirect)')
                 return False
             pw_field = pw_loc.first
 
@@ -659,7 +659,7 @@ def _try_autofill_credentials(
                     user_field = loc.first
                     break
             if user_field is None:
-                logger.info('[mvpd-login] autofill: password field present but no visible email/text input url=%s', _safe_page_url(page))
+                logger.info('[mvpd-login] autofill: password field present but no visible email/text input')
                 return False
 
             _focus_and_type(user_field, username)
@@ -669,19 +669,18 @@ def _try_autofill_credentials(
             got_user = user_field.input_value(timeout=2000)
             got_pw = pw_field.input_value(timeout=2000)
             if got_user != username or got_pw != password:
-                logger.info('[mvpd-login] autofill: values did not stick (attempt %d): user %d/%d chars, password %d/%d chars — page likely re-rendered mid-fill',
-                            fill_attempt, len(got_user), len(username), len(got_pw), len(password))
+                logger.info('[mvpd-login] autofill: values did not stick (attempt %d) — page likely re-rendered mid-fill', fill_attempt)
                 page.wait_for_timeout(700)
                 continue
 
             pw_field.press('Enter')
-            logger.info('[mvpd-login] autofill: filled and submitted credentials for %s (attempt %d)', username, fill_attempt)
+            logger.info('[mvpd-login] autofill: filled and submitted credentials (attempt %d)', fill_attempt)
             return True
 
-        logger.info('[mvpd-login] autofill: gave up — could not get a stable filled form url=%s', _safe_page_url(page))
+        logger.info('[mvpd-login] autofill: gave up — could not get a stable filled form')
         return False
     except Exception as exc:  # noqa: BLE001
-        logger.info('[mvpd-login] autofill: exception mid-fill: %s', exc)
+        logger.info('[mvpd-login] autofill: exception mid-fill (%s)', type(exc).__name__)
         return False
 
 
